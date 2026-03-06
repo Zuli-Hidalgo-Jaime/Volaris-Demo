@@ -1,0 +1,8 @@
+aiohttp
+botbuilder-core
+botbuilder-integration-aiohttp
+azure-identity
+azure-ai-projects==2.0.0b3
+python-dotenv
+openai
+azure-ai-agents
