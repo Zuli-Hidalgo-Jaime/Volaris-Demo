@@ -14,6 +14,8 @@ LOGGER = logging.getLogger(__name__)
 _DEFAULT_REPLY_ATTEMPTS = 2
 _DEFAULT_FALLBACK_ATTEMPTS = 2
 _DEFAULT_RETRY_DELAY_SECONDS = 0.6
+_DEFAULT_CHANNEL_TIMEOUT_SECONDS = 8
+_FAST_CHANNELS = {"msteams"}
 _RETRYABLE_ERROR_SNIPPETS = (
     "task was canceled",
     "connection aborted",
@@ -55,6 +57,28 @@ def _build_send_to_conversation_activity(turn_context: TurnContext, text: str) -
     return activity
 
 
+def _build_reply_activity(turn_context: TurnContext, text: str) -> Activity:
+    activity = MessageFactory.text(text)
+    reference = TurnContext.get_conversation_reference(turn_context.activity)
+    activity = TurnContext.apply_conversation_reference(activity, reference)
+    activity.id = None
+    activity.type = activity.type or ActivityTypes.message
+    activity.input_hint = activity.input_hint or "acceptingInput"
+    return activity
+
+
+def _get_connector_client(turn_context: TurnContext):
+    adapter = getattr(turn_context, "adapter", None)
+    turn_state = getattr(turn_context, "turn_state", None)
+    key = getattr(adapter, "BOT_CONNECTOR_CLIENT_KEY", None)
+    if not key or turn_state is None:
+        return None
+    getter = getattr(turn_state, "get", None)
+    if callable(getter):
+        return getter(key)
+    return None
+
+
 async def safe_send_text(
     turn_context: TurnContext,
     text: str,
@@ -63,17 +87,34 @@ async def safe_send_text(
     max_attempts: int = _DEFAULT_REPLY_ATTEMPTS,
     fallback_attempts: int = _DEFAULT_FALLBACK_ATTEMPTS,
     retry_delay_seconds: float = _DEFAULT_RETRY_DELAY_SECONDS,
+    channel_timeout_seconds: float = _DEFAULT_CHANNEL_TIMEOUT_SECONDS,
 ) -> bool:
     logger = logger or LOGGER
     attempts = max(1, int(max_attempts))
     fallback_tries = max(1, int(fallback_attempts))
     delay = max(0.0, float(retry_delay_seconds))
+    channel_timeout = max(0.1, float(channel_timeout_seconds))
     ctx = _message_context(turn_context)
     last_exc: Exception | None = None
+    connector_client = _get_connector_client(turn_context)
+    use_fast_connector_path = (
+        connector_client is not None
+        and ctx["channel_id"] in _FAST_CHANNELS
+    )
 
     for attempt in range(1, attempts + 1):
         try:
-            await turn_context.send_activity(MessageFactory.text(text))
+            if use_fast_connector_path:
+                activity = _build_reply_activity(turn_context, text)
+                await connector_client.conversations.reply_to_activity(
+                    activity.conversation.id,
+                    activity.reply_to_id,
+                    activity,
+                    timeout=channel_timeout,
+                )
+                turn_context.responded = True
+            else:
+                await turn_context.send_activity(MessageFactory.text(text))
             return True
         except Exception as exc:  # pragma: no cover - exercised via tests with concrete exception types
             last_exc = exc
@@ -97,7 +138,14 @@ async def safe_send_text(
     for attempt in range(1, fallback_tries + 1):
         try:
             activity = _build_send_to_conversation_activity(turn_context, text)
-            await turn_context.adapter.send_activities(turn_context, [activity])
+            if use_fast_connector_path:
+                await connector_client.conversations.send_to_conversation(
+                    activity.conversation.id,
+                    activity,
+                    timeout=channel_timeout,
+                )
+            else:
+                await turn_context.adapter.send_activities(turn_context, [activity])
             turn_context.responded = True
             logger.warning(
                 "Recovered channel send via send_to_conversation fallback on attempt %s/%s for conversation=%s activity=%s channel=%s host=%s after %s",
