@@ -12,6 +12,7 @@ from msrest.exceptions import ClientRequestError
 
 LOGGER = logging.getLogger(__name__)
 _DEFAULT_REPLY_ATTEMPTS = 2
+_DEFAULT_FALLBACK_ATTEMPTS = 2
 _DEFAULT_RETRY_DELAY_SECONDS = 0.6
 _RETRYABLE_ERROR_SNIPPETS = (
     "task was canceled",
@@ -19,6 +20,7 @@ _RETRYABLE_ERROR_SNIPPETS = (
     "remote end closed connection without response",
     "temporarily unavailable",
     "timeout",
+    "invalid status code ''",
 )
 
 
@@ -59,10 +61,12 @@ async def safe_send_text(
     *,
     logger: logging.Logger | None = None,
     max_attempts: int = _DEFAULT_REPLY_ATTEMPTS,
+    fallback_attempts: int = _DEFAULT_FALLBACK_ATTEMPTS,
     retry_delay_seconds: float = _DEFAULT_RETRY_DELAY_SECONDS,
 ) -> bool:
     logger = logger or LOGGER
     attempts = max(1, int(max_attempts))
+    fallback_tries = max(1, int(fallback_attempts))
     delay = max(0.0, float(retry_delay_seconds))
     ctx = _message_context(turn_context)
     last_exc: Exception | None = None
@@ -90,27 +94,39 @@ async def safe_send_text(
                 break
             await asyncio.sleep(delay * attempt)
 
-    try:
-        activity = _build_send_to_conversation_activity(turn_context, text)
-        await turn_context.adapter.send_activities(turn_context, [activity])
-        turn_context.responded = True
-        logger.warning(
-            "Recovered channel send via send_to_conversation fallback for conversation=%s activity=%s channel=%s host=%s after %s",
-            ctx["conversation_id"],
-            ctx["activity_id"],
-            ctx["channel_id"],
-            ctx["service_host"],
-            type(last_exc).__name__ if last_exc else "unknown_error",
-        )
-        return True
-    except Exception as exc:
-        logger.error(
-            "Channel send fallback failed for conversation=%s activity=%s channel=%s host=%s: %s",
-            ctx["conversation_id"],
-            ctx["activity_id"],
-            ctx["channel_id"],
-            ctx["service_host"],
-            exc,
-            exc_info=True,
-        )
-        return False
+    for attempt in range(1, fallback_tries + 1):
+        try:
+            activity = _build_send_to_conversation_activity(turn_context, text)
+            await turn_context.adapter.send_activities(turn_context, [activity])
+            turn_context.responded = True
+            logger.warning(
+                "Recovered channel send via send_to_conversation fallback on attempt %s/%s for conversation=%s activity=%s channel=%s host=%s after %s",
+                attempt,
+                fallback_tries,
+                ctx["conversation_id"],
+                ctx["activity_id"],
+                ctx["channel_id"],
+                ctx["service_host"],
+                type(last_exc).__name__ if last_exc else "unknown_error",
+            )
+            return True
+        except Exception as exc:
+            last_exc = exc
+            retryable = _is_retryable_send_error(exc)
+            logger.error(
+                "Channel fallback send failed on attempt %s/%s for conversation=%s activity=%s channel=%s host=%s retryable=%s: %s",
+                attempt,
+                fallback_tries,
+                ctx["conversation_id"],
+                ctx["activity_id"],
+                ctx["channel_id"],
+                ctx["service_host"],
+                retryable,
+                exc,
+                exc_info=True,
+            )
+            if not retryable or attempt >= fallback_tries:
+                break
+            await asyncio.sleep(delay * attempt)
+
+    return False

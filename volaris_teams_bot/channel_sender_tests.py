@@ -5,8 +5,20 @@ import unittest
 
 import requests
 from botbuilder.schema import Activity, ChannelAccount, ConversationAccount, ResourceResponse
+from botbuilder.schema._models_py3 import ErrorResponseException
 
 from channel_sender import safe_send_text
+
+
+class FakeErrorResponse:
+    reason = ""
+
+    def raise_for_status(self):
+        raise RuntimeError("channel send failed")
+
+
+def make_empty_status_error() -> ErrorResponseException:
+    return ErrorResponseException(lambda *args, **kwargs: None, FakeErrorResponse())
 
 
 class FakeAdapter:
@@ -96,7 +108,10 @@ class SafeSendTextTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_returns_false_when_primary_and_fallback_fail(self) -> None:
         adapter = FakeAdapter(
-            side_effects=[requests.exceptions.ConnectionError("Fallback failed.")]
+            side_effects=[
+                requests.exceptions.ConnectionError("Fallback failed."),
+                requests.exceptions.ConnectionError("Fallback failed again."),
+            ]
         )
         turn_context = FakeTurnContext(
             [requests.exceptions.ConnectionError("Connection aborted.")],
@@ -113,7 +128,27 @@ class SafeSendTextTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(sent)
         self.assertEqual(turn_context.send_calls, 1)
-        self.assertEqual(len(adapter.calls), 1)
+        self.assertEqual(len(adapter.calls), 2)
+
+    async def test_retries_empty_status_error_from_connector(self) -> None:
+        turn_context = FakeTurnContext(
+            [
+                make_empty_status_error(),
+                ResourceResponse(id="ok"),
+            ]
+        )
+
+        sent = await safe_send_text(
+            turn_context,
+            "hola",
+            logger=logging.getLogger("channel_sender_tests"),
+            max_attempts=2,
+            retry_delay_seconds=0,
+        )
+
+        self.assertTrue(sent)
+        self.assertEqual(turn_context.send_calls, 2)
+        self.assertEqual(len(turn_context.adapter.calls), 0)
 
 
 if __name__ == "__main__":
